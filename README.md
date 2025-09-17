@@ -37,7 +37,7 @@ stagei["Gene"] = stagei.index
 # -------------------------------
 # Select one sample for barplot
 # -------------------------------
-sample_id = "TCGA-E2-A1L7-11"
+sample_id = "X"
 y = stagei[["Gene", sample_id]]
 print(stagei.columns.tolist())
 
