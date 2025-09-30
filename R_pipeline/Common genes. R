@@ -1,0 +1,39 @@
+# ---- Load packages ----
+library(readxl)
+library(openxlsx)
+
+# ---- Function to find common genes ----
+find_common_genes <- function(file_path) {
+  # Get all sheet names
+  sheets <- excel_sheets(file_path)
+  
+  # Read all sheets as a list of gene vectors
+  gene_lists <- lapply(sheets, function(s) {
+    df <- read_excel(file_path, sheet = s)
+    df$Gene.symbol   # column with gene symbols
+  })
+  
+  # Find common genes across all sheets
+  Reduce(intersect, gene_lists)
+}
+
+# ---- Full file paths ----
+up_file   <- "E:/R/RStudio/R CLASS/Data/ALL up-down/All_Upregulated.xlsx"
+down_file <- "E:/R/RStudio/R CLASS/Data/ALL up-down/All_Downregulated.xlsx"
+
+# ---- Find common genes ----
+common_up   <- find_common_genes(up_file)
+common_down <- find_common_genes(down_file)
+
+# ---- Save results ----
+write.xlsx(
+  data.frame(Gene = common_up),
+  "E:/R/RStudio/R CLASS/Data/ALL up-down/Common_Upregulated.xlsx",
+  rowNames = FALSE
+)
+
+write.xlsx(
+  data.frame(Gene = common_down),
+  "E:/R/RStudio/R CLASS/Data/ALL up-down/Common_Downregulated.xlsx",
+  rowNames = FALSE
+)
