@@ -1,0 +1,42 @@
+# ---- Load packages ----
+install.packages("RobustRankAggreg")  
+
+
+library(readxl)
+library(openxlsx)
+library(RobustRankAggreg)
+
+# ---- Function: Read ranked gene lists from Excel ----
+read_ranked_genes <- function(file_path) {
+  sheets <- excel_sheets(file_path)
+  
+  lapply(sheets, function(s) {
+    df <- read_excel(file_path, sheet = s)
+    df$Gene.symbol   # take the Gene.symbol column directly
+  })
+}
+
+# ---- File paths ----
+up_file   <- "E:/R/RStudio/R CLASS/Data/Osteosarcoma up-down/All_Upregulated.xlsx"
+down_file <- "E:/R/RStudio/R CLASS/Data/Osteosarcoma up-down/All_Downregulated.xlsx"
+
+# ---- Read data ----
+up_lists   <- read_ranked_genes(up_file)
+down_lists <- read_ranked_genes(down_file)
+
+# ---- Apply Robust Rank Aggregation ----
+# Upregulated
+rra_up <- aggregateRanks(glist = up_lists)
+# Downregulated
+rra_down <- aggregateRanks(glist = down_lists)
+
+# ---- Save results ----
+write.xlsx(rra_up,
+           "E:/R/RStudio/R CLASS/Data/Osteosarcoma up-down/RRA_Upregulated.xlsx",
+           rowNames = FALSE
+)
+
+write.xlsx(rra_down,
+           "E:/R/RStudio/R CLASS/Data/Osteosarcoma up-down/RRA_Downregulated.xlsx",
+           rowNames = FALSE
+)
