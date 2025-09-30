@@ -6,7 +6,7 @@ This repository contains scripts for:
 
 ---
 
-## 📂 Project Structure
+##  Project Structure
 
 - `R_pipeline/` → R script for pseudo-bulk DEG analysis (Disease vs Control)
 - `Python_barplot/` → Python script for hub gene bar plots
@@ -14,7 +14,7 @@ This repository contains scripts for:
 
 ---
 
-## ▶️ Usage
+## Usage
 
 ### 1. R Pipeline
 - Navigate to `R_pipeline/`
