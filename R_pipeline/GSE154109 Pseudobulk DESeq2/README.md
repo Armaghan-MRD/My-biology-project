@@ -3,7 +3,6 @@
 **Pseudo-bulk differential expression analysis** (Disease vs Control)  
 This script uses **Seurat v5** to aggregate single-cell 10x Genomics data into pseudo-bulk counts per sample, and then performs **DESeq2** analysis.
 
----
 
 ## Overview
 - Input: 10x Genomics matrices from GSE154109 (stored in `Control/` and `Disease/` subfolders).
