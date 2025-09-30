@@ -1,0 +1,193 @@
+################################################################################
+# GSE116256: Control vs Disease 
+# limma-voom bulk DEG analysis (using summed single-cell counts per sample)
+################################################################################
+
+# ---- 0. Load packages ----
+required <- c("edgeR", "limma", "dplyr", "readr", "tibble")
+for (pkg in required) if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+
+suppressPackageStartupMessages({
+  library(limma)
+  library(edgeR)
+  library(dplyr)
+  library(readr)
+  library(tibble)
+})
+
+# ---- 1. Define input files ----
+control_files <- c("the/location/of/your/file")
+
+disease_files <- c("the/location/of/your/file")
+
+all_files <- c(control_files, disease_files)
+group <- factor(c(rep("Control", length(control_files)),
+                  rep("Disease", length(disease_files))))
+
+# ---- 2. Read and sum counts per sample ----
+count_list <- list()
+
+for (f in all_files) {
+  message("Reading: ", f)
+  df <- read.delim(f, header = TRUE, stringsAsFactors = FALSE)
+  
+  # Sum counts across all cells for bulk-level counts
+  bulk_counts <- df %>%
+    rowwise() %>%
+    mutate(total_count = sum(c_across(-Gene))) %>%
+    select(Gene, total_count)
+  
+  sid <- tools::file_path_sans_ext(basename(f))
+  colnames(bulk_counts)[2] <- sid
+  count_list[[sid]] <- bulk_counts
+}
+
+# ---- 3. Merge all samples into one matrix ----
+merged <- Reduce(function(x, y) merge(x, y, by = "Gene", all = TRUE), count_list)
+rownames(merged) <- merged$Gene
+merged <- merged[, -1]
+merged[is.na(merged)] <- 0
+
+# ---- 4. Build DGEList ----
+library(edgeR)
+
+y <- DGEList(counts = merged, group = group)
+
+# Filter lowly expressed genes
+keep <- filterByExpr(y)
+y <- y[keep, , keep.lib.sizes = FALSE]
+
+# Normalize
+y <- calcNormFactors(y)
+
+# ---- 5. Design & voom ----
+design <- model.matrix(~group)
+v <- voom(y, design, plot = TRUE)
+
+# ---- 6. Fit linear model ----
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+
+# ---- 7. Results ----
+res <- topTable(fit, coef = "groupDisease", n = Inf, sort.by = "P")
+res <- res %>%
+  rownames_to_column("gene") %>%
+  dplyr::select(gene, logFC, AveExpr, t, P.Value, adj.P.Val)
+
+# ---- 8. Save results ----
+write.csv(res, "E:/R/RStudio/R CLASS/Data/GSE116256/DEG_Disease_vs_Control.csv", row.names = FALSE)
+sig <- res %>% filter(!is.na(adj.P.Val) & adj.P.Val < 0.05 & abs(logFC) > 1)
+write.csv(sig, "E:/R/RStudio/R CLASS/Data/GSE116256/DEG_Disease_vs_Control_sig.csv", row.names = FALSE)
+
+message("Analysis complete. Full and significant DEGs saved.")
+################################################################################
+# End
+Armaghan_MRD
+################################################################################
+
+################################################################################
+# ---- 9. Volcano Plot ----
+################################################################################
+library(ggplot2)
+
+# Add a column for significance
+res <- res %>%
+  mutate(sig = case_when(
+    adj.P.Val < 0.05 & logFC > 1  ~ "Up",
+    adj.P.Val < 0.05 & logFC < -1 ~ "Down",
+    TRUE                          ~ "NS"
+  ))
+
+# Basic volcano plot
+volcano <- ggplot(res, aes(x = logFC, y = -log10(P.Value), color = sig)) +
+  geom_point(alpha = 0.6) +
+  scale_color_manual(values = c("Up" = "red", "Down" = "blue", "NS" = "grey")) +
+  theme_minimal() +
+  xlab("log2 Fold Change") +
+  ylab("-log10(P-value)") +
+  ggtitle("Volcano Plot: Disease vs Control") +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black")
+
+ggsave("E:/R/RStudio/R CLASS/Data/GSE116256/volcano_plot.png", volcano, width = 8, height = 6)
+
+################################################################################
+# ---- 10. Heatmap of top DEGs ----
+################################################################################
+library(pheatmap)
+
+# Select top 50 significant DEGs
+top_genes <- sig %>% arrange(adj.P.Val) %>% head(50) %>% pull(gene)
+heat_data <- merged[top_genes, ]
+
+# Normalize for visualization (log2 CPM)
+logcpm <- cpm(DGEList(counts = heat_data), log = TRUE, prior.count = 1)
+
+pheatmap(logcpm,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         main = "Top 50 DEGs Heatmap",
+         filename = "E:/R/RStudio/R CLASS/Data/GSE116256/heatmap_top50DEGs.png",
+         width = 10,
+         height = 10)
+
+################################################################################
+# ---- 11. Basic GO / KEGG Enrichment ----
+################################################################################
+# install.packages("clusterProfiler")
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# 1. Convert symbols -> ENTREZ IDs
+entrez_ids <- bitr(sig$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)
+head(entrez_ids)
+
+# 2. Only proceed if we have ENTREZ IDs
+
+if(nrow(entrez_ids) > 0){
+  
+  go_res <- enrichGO(
+    gene = entrez_ids$ENTREZID,
+    OrgDb = org.Hs.eg.db,
+    keyType = "ENTREZID",
+    ont = "BP",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 0.05,
+    qvalueCutoff = 0.2,
+    readable = TRUE
+  )
+  
+  
+  
+  if(nrow(as.data.frame(go_res)) > 0){
+    write.csv(as.data.frame(go_res), "GO_enrichment_sigDEGs.csv", row.names=FALSE)
+    barplot(go_res, showCategory = 20, title = "GO BP Enrichment of DEGs")
+    ggsave("GO_enrichment_barplot.png", width=10, height=6)
+  } else {
+    message("No significant GO terms found.")
+  }
+  
+} else {
+  stop("No valid ENTREZ IDs found! Check your gene symbols.")
+}
+
+
+
+length(sig$gene)      # how many significant DEGs
+entrez_ids <- bitr(sig$gene, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)
+nrow(entrez_ids)      # how many mapped ENTREZ IDs
+
+
+go_res <- enrichGO(gene = entrez_ids$ENTREZID,
+                   OrgDb = org.Hs.eg.db,
+                   keyType = "ENTREZID",
+                   ont = "BP",
+                   pAdjustMethod = "BH",
+                   pvalueCutoff = 0.1,    # relax from 0.05
+                   qvalueCutoff = 0.3,    # relax from 0.2
+                   readable = TRUE)
+
+
+nrow(as.data.frame(go_res))
