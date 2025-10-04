@@ -1,0 +1,153 @@
+# ============================================================
+# Osteosarcoma RRA Analysis & Heatmaps
+# Author: Armaghan Moradi
+# ============================================================
+
+# --- Libraries ---
+library(RobustRankAggreg)
+library(readxl)
+library(pheatmap)
+library(dplyr)
+
+# --- File paths ---
+up_file   <- "E:/R/RStudio/R CLASS/Data/Osteosarcoma up-down/All_Upregulated.xlsx"
+down_file <- "E:/R/RStudio/R CLASS/Data/Osteosarcoma up-down/All_Downregulated.xlsx"
+setwd("E:/R/RStudio/R CLASS/Data/Osteosarcoma up-down/")
+
+# ============================================================
+# 1. Load ranked gene lists (Up/Down)
+# ============================================================
+
+# Upregulated
+gse36001_up <- unique(read_excel(up_file, sheet = "GSE36001")[["Gene.symbol"]])
+gse16088_up <- unique(read_excel(up_file, sheet = "GSE16088")[["Gene.symbol"]])
+gse42352_up <- unique(read_excel(up_file, sheet = "GSE42352")[["Gene.symbol"]])
+
+glist_up <- list(gse36001_up, gse16088_up, gse42352_up)
+
+# Downregulated
+gse36001_down <- unique(read_excel(down_file, sheet = "GSE36001")[["Gene.symbol"]])
+gse16088_down <- unique(read_excel(down_file, sheet = "GSE16088")[["Gene.symbol"]])
+gse42352_down <- unique(read_excel(down_file, sheet = "GSE42352")[["Gene.symbol"]])
+
+glist_down <- list(gse36001_down, gse16088_down, gse42352_down)
+
+# ============================================================
+# 2. Universe size (all unique genes across all lists)
+# ============================================================
+all_genes <- unique(c(unlist(glist_up), unlist(glist_down)))
+N <- length(all_genes)
+
+# ============================================================
+# 3. RRA Analysis
+# ============================================================
+
+# Up
+rra_up <- aggregateRanks(glist = glist_up, N = N)
+k <- length(glist_up)
+rra_up$Rho_Corrected <- pmin(rra_up$Score * k, 1)
+rra_up$Adjusted_P <- p.adjust(rra_up$Rho_Corrected, method = "fdr")
+write.csv(rra_up, "osteosarcoma_up_rra_results.csv", row.names = FALSE)
+
+# Down
+rra_down <- aggregateRanks(glist = glist_down, N = N)
+rra_down$Rho_Corrected <- pmin(rra_down$Score * k, 1)
+rra_down$Adjusted_P <- p.adjust(rra_down$Rho_Corrected, method = "fdr")
+write.csv(rra_down, "osteosarcoma_down_rra_results.csv", row.names = FALSE)
+
+# ============================================================
+# 4. Load full DE tables (logFC if available)
+# ============================================================
+
+read_de_full <- function(file, sheet, direction) {
+  df <- read_excel(file, sheet = sheet)
+  if (!"Gene.symbol" %in% colnames(df)) stop(paste("Gene.symbol missing in", sheet, direction))
+  if (!"logFC" %in% colnames(df)) warning(paste("logFC missing in", sheet, direction))
+  return(df)
+}
+
+# Combine up + down per dataset
+gse36001_de <- bind_rows(read_de_full(up_file, "GSE36001", "up"),
+                         read_de_full(down_file, "GSE36001", "down"))
+gse16088_de <- bind_rows(read_de_full(up_file, "GSE16088", "up"),
+                         read_de_full(down_file, "GSE16088", "down"))
+gse42352_de <- bind_rows(read_de_full(up_file, "GSE42352", "up"),
+                         read_de_full(down_file, "GSE42352", "down"))
+
+# ============================================================
+# 5. Build logFC matrix
+# ============================================================
+
+unique_genes <- unique(c(gse36001_de$Gene.symbol,
+                         gse16088_de$Gene.symbol,
+                         gse42352_de$Gene.symbol))
+
+mat <- matrix(0, nrow = length(unique_genes), ncol = 3,
+              dimnames = list(unique_genes, c("GSE36001", "GSE16088", "GSE42352")))
+
+fill_mat <- function(de, col_name, mat) {
+  overlap <- intersect(de$Gene.symbol, rownames(mat))
+  mat[overlap, col_name] <- de$logFC[match(overlap, de$Gene.symbol)]
+  return(mat)
+}
+
+mat <- fill_mat(gse36001_de, "GSE36001", mat)
+mat <- fill_mat(gse16088_de, "GSE16088", mat)
+mat <- fill_mat(gse42352_de, "GSE42352", mat)
+
+# ============================================================
+# 6. Filter to top RRA genes
+# ============================================================
+
+top_up   <- head(rra_up[order(rra_up$Adjusted_P), ], 20)$Name
+top_down <- head(rra_down[order(rra_down$Adjusted_P), ], 20)$Name
+top_genes <- unique(c(top_up, top_down))
+
+mat_top <- mat[top_genes, , drop = FALSE]
+
+# ============================================================
+# 7. Heatmaps
+# ============================================================
+
+# --- LogFC heatmap ---
+set.seed(42)
+pheatmap(mat_top,
+         color = colorRampPalette(c("#2e4057", "white", "#d1495b"))(50),
+         main = "LogFC of Top RRA Genes Across GSE Datasets",
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         fontsize_row = 8,
+         show_rownames = TRUE,
+         na_col = "grey",
+         filename = "osteosarcoma_logfc_heatmap22.png",
+         width = 8, height = 10, units = "in", res = 300)
+
+# --- Sign-based heatmap ---
+mat_alt <- matrix(0, nrow = length(all_genes), ncol = 3,
+                  dimnames = list(all_genes, c("GSE36001", "GSE16088", "GSE42352")))
+
+mat_alt[gse36001_up, "GSE36001"]   <- 1
+mat_alt[gse36001_down, "GSE36001"] <- -1
+mat_alt[gse16088_up, "GSE16088"]   <- 1
+mat_alt[gse16088_down, "GSE16088"] <- -1
+mat_alt[gse42352_up, "GSE42352"]   <- 1
+mat_alt[gse42352_down, "GSE42352"] <- -1
+
+mat_top_alt <- mat_alt[top_genes, , drop = FALSE]
+
+pheatmap(mat_top_alt,
+         color = colorRampPalette(c("#2e4057", "white", "#d1495b"))(3),
+         breaks = c(-1.5, -0.5, 0.5, 1.5),
+         main = "Regulation Sign of Top RRA Genes Across GSE Datasets",
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         fontsize_row = 8,
+         show_rownames = TRUE,
+         legend_breaks = c(-1, 0, 1),
+         legend_labels = c("Down", "Neutral", "Up"),
+         filename = "osteosarcoma_sign_heatmap22.png",
+         width = 8, height = 10, units = "in", res = 300)
+
+# ============================================================
+# END OF SCRIPT
+# ============================================================
