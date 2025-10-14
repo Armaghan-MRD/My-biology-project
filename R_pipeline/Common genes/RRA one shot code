@@ -1,0 +1,246 @@
+# =============================================================
+# One-shot RRA + diagnostics + blood-sensitivity pipeline
+
+
+# ---------- CONFIG ----------
+base_dir <- "E:/R/RStudio/R CLASS/Data/text file"   # <- CHANGE if needed
+setwd(base_dir)
+
+# list your DEG files here (tab-delimited with header: Gene, logFC, P.Value, adj.P.Val)
+files <- c(".txt", "txt", ".txt")
+out_prefix <- "Osteosarcoma"
+
+# If your files were truncated (only DEG subset), set universe_N manually (e.g. 20000)
+universe_N <- 20000
+
+# Auto-flip settings: automatically flip a dataset's sign if it increases mean pairwise correlation by > flip_threshold
+auto_flip <- TRUE
+flip_threshold <- 0.15
+
+# Blood gene list for sensitivity (expand if you want)
+blood_gene_list <- c("HBA1","HBA2","HBB","HBQ1","HBD","HBE1","GYPB","GYPA","ALAS2","SLC4A1","SLC14A1","BPGM","HBG1","HBG2")
+
+# ---------- PACKAGES ----------
+pkgs <- c("dplyr","readr","RobustRankAggreg","pheatmap","openxlsx")
+for(p in pkgs) if(!requireNamespace(p, quietly=TRUE)) stop("Install package: ", p)
+library(dplyr); library(readr); library(RobustRankAggreg); library(pheatmap); library(openxlsx)
+
+# ---------- HELPERS ----------
+read_deg_txt <- function(path) {
+  df <- tryCatch(read_delim(path, delim = "\t", show_col_types = FALSE),
+                 error = function(e) tryCatch(read_delim(path, delim = " ", show_col_types = FALSE),
+                                              error = function(e2) read.table(path, header = TRUE, sep = "", stringsAsFactors = FALSE)))
+  names(df) <- gsub("^\\s+|\\s+$", "", names(df))
+  gene_col <- intersect(c("Gene","Gene.symbol","SYMBOL","gene","ID"), names(df))[1]
+  if (is.na(gene_col) || is.null(gene_col)) stop("No gene column detected in ", path)
+  df <- df %>% rename(Gene.symbol = all_of(gene_col))
+  if ("logFC" %in% names(df)) df <- df %>% rename(logFC = logFC)
+  else if ("log2FoldChange" %in% names(df)) df <- df %>% rename(logFC = log2FoldChange)
+  else df$logFC <- NA_real_
+  if ("adj.P.Val" %in% names(df)) df <- df %>% rename(adj.P.Val = adj.P.Val)
+  else if ("padj" %in% names(df)) df <- df %>% rename(adj.P.Val = padj)
+  else df$adj.P.Val <- NA_real_
+  df <- df %>% mutate(Gene.symbol = as.character(Gene.symbol)) %>% filter(!is.na(Gene.symbol))
+  df <- df %>% distinct(Gene.symbol, .keep_all = TRUE)
+  return(as.data.frame(df))
+}
+
+make_ranked_vectors <- function(df) {
+  if (any(!is.na(df$logFC))) {
+    up <- df %>% arrange(desc(logFC), adj.P.Val) %>% pull(Gene.symbol)
+    down <- df %>% arrange(logFC, adj.P.Val) %>% pull(Gene.symbol)
+  } else {
+    up <- df$Gene.symbol
+    down <- rev(df$Gene.symbol)
+  }
+  up <- unique(up[!is.na(up)]); down <- unique(down[!is.na(down)])
+  list(up=up, down=down)
+}
+
+attach_meta <- function(rra_obj, mat) {
+  tmp <- as.data.frame(rra_obj)
+  tmp2 <- dplyr::left_join(tmp, data.frame(Gene.symbol = rownames(mat), mat, stringsAsFactors = FALSE), by = c("Name" = "Gene.symbol"))
+  logfc_cols <- intersect(colnames(mat), colnames(tmp2))
+  meta <- t(apply(tmp2[, logfc_cols, drop=FALSE], 1, function(x) {
+    nobs <- sum(!is.na(x))
+    mean_fc <- if(nobs==0) NA else mean(x, na.rm=TRUE)
+    pct_up <- if(nobs==0) NA else sum(x>0, na.rm=TRUE)/nobs
+    consensus <- if(is.na(pct_up)) NA else if(pct_up==1) "consistent_up" else if(pct_up==0) "consistent_down" else "mixed"
+    c(n_datasets = nobs, mean_fc = round(mean_fc,3), pct_up = round(pct_up,3), consensus = consensus)
+  }))
+  meta <- as.data.frame(meta, stringsAsFactors = FALSE)
+  meta$n_datasets <- as.integer(meta$n_datasets)
+  meta$mean_fc <- as.numeric(meta$mean_fc)
+  meta$pct_up <- as.numeric(meta$pct_up)
+  return(bind_cols(tmp2, meta))
+}
+
+# ---------- READ & PREP ----------
+gse_names <- tools::file_path_sans_ext(basename(files))
+gse_list <- list(); glist_up <- list(); glist_down <- list(); measured_genes <- character(0)
+
+for (i in seq_along(files)) {
+  f <- files[i]
+  if (!file.exists(f)) stop("File not found: ", f)
+  gse_list[[gse_names[i]]] <- read_deg_txt(f)
+  r <- make_ranked_vectors(gse_list[[gse_names[i]]])
+  glist_up[[gse_names[i]]] <- r$up
+  glist_down[[gse_names[i]]] <- r$down
+  measured_genes <- union(measured_genes, gse_list[[gse_names[i]]]$Gene.symbol)
+  cat("Loaded", gse_names[i], "- genes:", nrow(gse_list[[gse_names[i]]]), " logFC present:", any(!is.na(gse_list[[gse_names[i]]]$logFC)), "\n")
+}
+
+# ---------- UNIVERSE ----------
+if (!is.null(universe_N)) {
+  N <- as.integer(universe_N); cat("Using user-provided N =", N, "\n")
+} else {
+  N <- length(unique(measured_genes)); cat("Computed universe N =", N, "\n")
+}
+
+# ---------- FUNCTION to run RRA and compute mat ----------
+run_rra_and_mat <- function(glist_up, glist_down, gse_list) {
+  rra_up <- aggregateRanks(glist = glist_up, N = N)
+  rra_down <- aggregateRanks(glist = glist_down, N = N)
+  rra_up$Adjusted_P <- p.adjust(rra_up$Score, method = "fdr")
+  rra_down$Adjusted_P <- p.adjust(rra_down$Score, method = "fdr")
+  all_genes_all <- unique(unlist(lapply(gse_list, function(x) x$Gene.symbol)))
+  mat <- matrix(NA_real_, nrow = length(all_genes_all), ncol = length(gse_list),
+                dimnames = list(all_genes_all, names(gse_list)))
+  for (nm in names(gse_list)) {
+    df <- gse_list[[nm]]
+    if ("logFC" %in% colnames(df) && any(!is.na(df$logFC))) {
+      idx <- match(df$Gene.symbol, rownames(mat)); valid <- which(!is.na(idx))
+      mat[idx[valid], nm] <- df$logFC[valid]
+    }
+  }
+  list(rra_up=rra_up, rra_down=rra_down, mat=mat)
+}
+
+res <- run_rra_and_mat(glist_up, glist_down, gse_list)
+rra_up <- res$rra_up; rra_down <- res$rra_down; mat <- res$mat
+
+# ---------- DIAGNOSTICS & AUTO-FLIP ----------
+compute_mean_pairwise <- function(m) {
+  cm <- cor(m, use = "pairwise.complete.obs")
+  if (ncol(cm) < 2) return(NA)
+  mean(cm[upper.tri(cm)], na.rm = TRUE)
+}
+cat("\nInitial pairwise correlations (rounded):\n"); print(round(cor(mat, use = "pairwise.complete.obs"), 2))
+base_mean_corr <- compute_mean_pairwise(mat)
+cat("Initial mean pairwise corr:", round(base_mean_corr,3), "\n")
+
+# Flip-test for each dataset: compute mean pairwise correlation if flipped
+flip_gain <- sapply(colnames(mat), function(nm) {
+  mf <- mat; mf[, nm] <- -mf[, nm]
+  new_mean <- compute_mean_pairwise(mf)
+  gain <- new_mean - base_mean_corr
+  return(gain)
+})
+print(round(flip_gain, 3))
+
+# Auto-flip if improves by threshold
+flipped <- character(0)
+if (auto_flip) {
+  for(nm in names(flip_gain)) {
+    if (!is.na(flip_gain[nm]) && flip_gain[nm] > flip_threshold) {
+      cat("Auto-flipping", nm, " (gain =", round(flip_gain[nm],3), ")\n")
+      # flip in gse_list
+      gse_list[[nm]]$logFC <- - gse_list[[nm]]$logFC
+      # flip in glist vectors by recomputing
+      rv <- make_ranked_vectors(gse_list[[nm]])
+      glist_up[[nm]] <- rv$up; glist_down[[nm]] <- rv$down
+      flipped <- c(flipped, nm)
+    }
+  }
+  if (length(flipped) > 0) {
+    # re-run RRA and mat after flips
+    cat("Re-running RRA after flips: ", paste(flipped, collapse=", "), "\n")
+    res <- run_rra_and_mat(glist_up, glist_down, gse_list)
+    rra_up <- res$rra_up; rra_down <- res$rra_down; mat <- res$mat
+    cat("New pairwise correlations (rounded):\n"); print(round(cor(mat, use = "pairwise.complete.obs"), 2))
+    cat("New mean pairwise corr:", round(compute_mean_pairwise(mat), 3), "\n")
+  } else cat("No dataset passed flip threshold (no auto-flips).\n")
+}
+
+# ---------- Attach metadata (per-GSE logFCs) ----------
+rra_up_out <- attach_meta(rra_up, mat)
+rra_down_out <- attach_meta(rra_down, mat)
+
+
+
+
+# ---------- BLOOD GENE SENSITIVITY ----------
+top_down_before <- head(rra_down_out$Name[order(rra_down_out$Adjusted_P)], 100)
+blood_hits <- intersect(top_down_before, blood_gene_list)
+cat("Blood/erythroid genes among top 100 down hits:", paste(blood_hits, collapse=", "), "\n")
+
+# Remove blood genes from lists and re-run RRA
+glist_up_filt <- lapply(glist_up, function(v) setdiff(v, blood_gene_list))
+glist_down_filt <- lapply(glist_down, function(v) setdiff(v, blood_gene_list))
+rra_down_filtered <- aggregateRanks(glist = glist_down_filt, N = N)
+rra_up_filtered <- aggregateRanks(glist = glist_up_filt, N = N)
+rra_down_filtered$Adjusted_P <- p.adjust(rra_down_filtered$Score, method="fdr")
+rra_up_filtered$Adjusted_P <- p.adjust(rra_up_filtered$Score, method="fdr")
+
+# compute overlap of top50 (down)
+top_before <- head(rra_down_out$Name[order(rra_down_out$Adjusted_P)], 50)
+top_after  <- head(rra_down_filtered$Name[order(rra_down_filtered$Score)], 50)
+overlap_count <- length(intersect(top_before, top_after))
+cat("Overlap before/after (top50 down):", overlap_count, "of 50\n")
+cat("Dropped (blood-driven) genes among top50:", paste(setdiff(top_before, top_after), collapse=", "), "\n")
+
+# ---------- SAVE OUTPUTS ----------
+wb <- createWorkbook()
+addWorksheet(wb, "RRA_up"); addWorksheet(wb, "RRA_down")
+addWorksheet(wb, "RRA_up_filtered"); addWorksheet(wb, "RRA_down_filtered")
+writeData(wb, "RRA_up", attach_meta(rra_up, mat))
+writeData(wb, "RRA_down", attach_meta(rra_down, mat))
+writeData(wb, "RRA_up_filtered", attach_meta(rra_up_filtered, mat))
+writeData(wb, "RRA_down_filtered", attach_meta(rra_down_filtered, mat))
+saveWorkbook(wb, paste0(out_prefix, "_RRA_results_final.xlsx"), overwrite = TRUE)
+
+saveRDS(list(gse_list=gse_list, mat=mat, rra_up=rra_up, rra_down=rra_down,
+             rra_down_filtered = rra_down_filtered, rra_up_filtered = rra_up_filtered,
+             glist_up=glist_up, glist_down=glist_down),
+        file = paste0(out_prefix, "_rra_objects_final.rds"))
+
+# ---------- HEATMAPS ----------
+# top genes pre and post filter
+top_genes_before <- unique(c(head(rra_up_out$Name[order(rra_up_out$Adjusted_P)], 20),
+                             head(rra_down_out$Name[order(rra_down_out$Adjusted_P)], 20)))
+top_genes_after  <- unique(c(head(rra_up_filtered$Name[order(rra_up_filtered$Score)], 20),
+                             head(rra_down_filtered$Name[order(rra_down_filtered$Score)], 20)))
+
+plot_heatmap <- function(glist, mat, fname, main_title) {
+  genes <- intersect(rownames(mat), glist)
+  if (length(genes) == 0) { cat("No genes for heatmap:", fname, "\n"); return(NULL) }
+  m <- mat[genes, , drop = FALSE]
+  display_numbers <- matrix("", nrow = nrow(m), ncol = ncol(m), dimnames = dimnames(m))
+  num_idx <- which(!is.na(m), arr.ind = TRUE)
+  for(i in seq_len(nrow(num_idx))) {
+    r <- num_idx[i,1]; c <- num_idx[i,2]
+    display_numbers[r,c] <- formatC(m[r,c], digits = 2, format = "f")
+  }
+  png(fname, width = 8, height = 10, units = "in", res = 300)
+  tryCatch({
+    pheatmap(m, color = colorRampPalette(c("#2e4057","white","#d1495b"))(50),
+             main = main_title, display_numbers = display_numbers,
+             cluster_rows = FALSE,
+             cluster_cols = TRUE,
+             angle_col = 45)
+  }, error = function(e) { message("Heatmap failed: ", e) })
+  dev.off()
+}
+
+plot_heatmap(top_genes_before, mat, paste0(out_prefix,"_heatmap_before.png"), "Top genes (before blood filter)")
+plot_heatmap(top_genes_after, mat, paste0(out_prefix,"_heatmap_after.png"), "Top genes")
+
+# ---------- FINAL SUMMARY print ----------
+cat("\n=== PIPELINE FINISHED ===\n")
+cat("Files created:\n -", paste0(out_prefix, "_RRA_results_final.xlsx"), "\n -", paste0(out_prefix, "_rra_objects_final.rds"), "\n -", paste0(out_prefix, "_heatmap_before.png"), "\n -", paste0(out_prefix, "_heatmap_after.png"), "\n")
+cat("\nSummary:\n")
+cat("Universe N:", N, "\n")
+cat("Datasets auto-flipped (if any):", if(length(flipped)>0) paste(flipped, collapse=", ") else "NONE", "\n")
+cat("Blood genes among top100 down:", paste(blood_hits, collapse=", "), "\n")
+cat("Overlap top50 down before/after removing blood genes:", overlap_count, "/50\n")
+sessionInfo()
