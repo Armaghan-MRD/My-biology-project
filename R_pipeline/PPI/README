@@ -1,0 +1,23 @@
+# Universal PPI Builder (BioGRID → Cytoscape)
+
+**Author:** Armaghan Moradi  
+**Language:** R  
+**Purpose:** Build clean protein–protein interaction (PPI) networks from BioGRID and differential gene expression (DEG) data for Cytoscape visualization.
+
+---
+
+🧠 Features
+- Works with any project (e.g., Neuroblastoma, Osteosarcoma, etc.)
+- Reads DEGs from Excel (Up/Down-regulated)
+- Extracts matching interactions from BioGRID
+- Computes centrality metrics (degree, betweenness, closeness)
+- Outputs Cytoscape-ready edge and node tables
+- Automatically builds “core + first neighbor” subnetworks
+
+---
+
+ ⚙️ Requirements
+Install required R packages:
+```r
+pkgs <- c("readxl", "dplyr", "stringr", "readr", "data.table", "tibble", "igraph")
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
