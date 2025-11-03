@@ -1,0 +1,167 @@
+# TF–Protein Workflow R script
+# Inputs (edit paths below if necessary)
+deg_file      <- "E:/R/RStudio/R CLASS/Plots/RRA filessssss/AML__RRA_results_final.xlsx"
+biogrid_file  <- "E:/R/RStudio/R CLASS/Plots/RRA filessssss/BIOGRID-ORGANISM-Homo_sapiens-5.0.250.tab3.txt"
+out_dir       <- "E:/R/RStudio/R CLASS/Plots/PPI/AML"
+
+up_sheet      <- 3
+down_sheet    <- 4
+filter_mode   <- "any" # "any" or "both"
+
+# Output file names (will be written to out_dir)
+edge_file <- file.path(out_dir, "TF_Protein_Interactions.tsv")
+node_file <- file.path(out_dir, "TF_Node_attributes.tsv")
+enrich_file <- file.path(out_dir, "TF_Enrichment_summary.tsv")
+
+# -------------------------
+# Dependencies
+# -------------------------
+pkgs <- c("readxl","dplyr","stringr","data.table","igraph","readr","enrichR","openxlsx")
+install_if_missing <- function(p) {
+  if(!requireNamespace(p, quietly = TRUE)) {
+    install.packages(p, repos = "https://cloud.r-project.org")
+  }
+  suppressPackageStartupMessages(library(p, character.only = TRUE))
+}
+for(p in pkgs) install_if_missing(p)
+
+# -------------------------
+# 1) Read DEGs from Excel
+# -------------------------
+message("Reading DEGs from: ", deg_file)
+up_df <- readxl::read_excel(deg_file, sheet = up_sheet)
+down_df <- readxl::read_excel(deg_file, sheet = down_sheet)
+
+# Try to detect gene column names
+possible_gene_cols <- c("gene","Gene","GeneSymbol","Symbol","GENE")
+find_gene_col <- function(df){
+  cols <- colnames(df)
+  hit <- intersect(possible_gene_cols, cols)
+  if(length(hit)) return(hit[1])
+  # fallback: first column
+  return(cols[1])
+}
+up_gene_col <- find_gene_col(up_df)
+down_gene_col <- find_gene_col(down_df)
+up_genes <- unique(na.omit(as.character(up_df[[up_gene_col]])))
+down_genes <- unique(na.omit(as.character(down_df[[down_gene_col]])))
+all_deg <- unique(c(up_genes, down_genes))
+message("Found ", length(up_genes), " UP genes; ", length(down_genes), " DOWN genes; total ", length(all_deg))
+
+# -------------------------
+# 2) Load BioGRID PPI file (tab3 format)
+# -------------------------
+message("Reading BioGRID file (may be large): ", biogrid_file)
+bg <- data.table::fread(biogrid_file, sep = "\t", quote = "", header = TRUE, fill = TRUE, data.table = FALSE)
+# BioGRID tab3 has columns like 'Official Symbol Interactor A' and 'Official Symbol Interactor B'
+colA <- grep("Official Symbol Interactor A", colnames(bg), value = TRUE)[1]
+colB <- grep("Official Symbol Interactor B", colnames(bg), value = TRUE)[1]
+if(is.na(colA) || is.na(colB)){
+  stop("Could not find expected BioGRID columns 'Official Symbol Interactor A/B'. Check file format.")
+}
+ppi <- bg[, c(colA, colB)]
+colnames(ppi) <- c("A","B")
+# Keep only human-human interactions: often the file is organism-specific, but double-check taxon IDs if present
+if("Organism Interactor A" %in% colnames(bg) && "Organism Interactor B" %in% colnames(bg)){
+  try({
+    taxA <- bg[,"Organism Interactor A"]
+    taxB <- bg[,"Organism Interactor B"]
+    # If both columns equal "Homo sapiens" or taxid 9606 then keep
+    keep_idx <- which((taxA == "Homo sapiens" | taxA == "9606") & (taxB == "Homo sapiens" | taxB == "9606"))
+    if(length(keep_idx) > 0) ppi <- ppi[keep_idx, , drop = FALSE]
+  }, silent = TRUE)
+}
+
+# -------------------------
+# 3) Identify TF list to mark TF nodes
+# -------------------------
+# We'll use a built-in minimal TF list (if user wants to supply a custom TF list, they can replace this)
+# For a more comprehensive list, download AnimalTFDB or JASPAR TF lists and provide as a file.
+default_tf_list <- c("TP53","MYC","NFkB1","STAT3","HIF1A","FOXO3","E2F1","SP1","NFKB1","JUN","FOS","CREB1") # example seed
+# Try to obtain a larger TF list using the 'TFTargets' or local files if available - simple fallback here
+tf_candidates <- toupper(default_tf_list)
+
+# -------------------------
+# 4) Filter BioGRID interactions to those involving our DEGs and identify TF–protein edges
+# -------------------------
+# Normalize gene symbols in ppi to uppercase for matching
+ppi$A_up <- toupper(ppi$A)
+ppi$B_up <- toupper(ppi$B)
+deg_up <- toupper(all_deg)
+# keep edges where either A or B is in degs (filter_mode "any" or "both")
+if(filter_mode == "any"){
+  keep <- (ppi$A_up %in% deg_up) | (ppi$B_up %in% deg_up)
+} else {
+  keep <- (ppi$A_up %in% deg_up) & (ppi$B_up %in% deg_up)
+}
+ppi_filt <- ppi[keep, , drop = FALSE]
+message("Filtered PPI to ", nrow(ppi_filt), " interactions after applying deg filter (mode=", filter_mode, ")")
+
+# Identify TF nodes among the DEG-set using default TF list (user may substitute a fuller TF table)
+ppi_filt$A_is_TF <- ppi_filt$A_up %in% tf_candidates
+ppi_filt$B_is_TF <- ppi_filt$B_up %in% tf_candidates
+
+# Define TF-protein interactions: one side is TF and the other is any protein
+tf_edges_idx <- which(ppi_filt$A_is_TF | ppi_filt$B_is_TF)
+tf_edges <- ppi_filt[tf_edges_idx, c("A","B")]
+
+# If no TFs found (because default list is small), try to use motif/ChEA later (we'll still export all edges)
+if(nrow(tf_edges) == 0){
+  warning("No TF edges found with the small default TF list. Consider providing a larger TF list (AnimalTFDB/JASPAR). Exporting all DEG-related PPIs instead.")
+  tf_edges <- ppi_filt[, c("A","B")]
+}
+
+# -------------------------
+# 5) Build igraph and compute node attributes (degree, betweenness, closeness)
+# -------------------------
+library(igraph)
+g <- graph_from_data_frame(tf_edges, directed = FALSE)
+V(g)$name <- toupper(V(g)$name) # unify
+deg <- degree(g)
+btw <- betweenness(g)
+cls <- closeness(g)
+node_df <- data.frame(Gene = names(deg), Degree = as.integer(deg), Betweenness = btw, Closeness = cls, stringsAsFactors = FALSE)
+# mark TFs in node_df using tf_candidates
+node_df$Is_TF <- node_df$Gene %in% tf_candidates
+
+# -------------------------
+# 6) Export files for Cytoscape
+# -------------------------
+if(!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+write.table(tf_edges, edge_file, sep = "\t", row.names = FALSE, col.names = c("Source","Target"), quote = FALSE)
+write.table(node_df, node_file, sep = "\t", row.names = FALSE, quote = FALSE)
+
+# -------------------------
+# 7) Enrichment (ChEA, ENCODE, TRRUST) using enrichR package
+# -------------------------
+message("Running TF enrichment with enrichR (ChEA_2016 / ENCODE / TRRUST). You can change DB names as needed.")
+enrichr_dbs <- c("ChEA_2016","ENCODE_and_ChEA_Consensus_TFs_from_ChIP-X","TRRUST_transcription_factors_2019")
+# Check available databases and filter
+avail <- enrichR::listEnrichrDbs()
+use_dbs <- intersect(enrichr_dbs, avail$libraryName)
+if(length(use_dbs)==0) message("No requested enrichR DBs found in your local list. You might need internet to use enrichR or install DBs.")
+res_list <- list()
+try({
+  res_list <- enrichR::enrichr(up_genes, use_dbs)
+}, silent = TRUE)
+# Combine results into a single table
+if(length(res_list)>0){
+  comb <- do.call(rbind, lapply(names(res_list), function(nm){
+    df <- res_list[[nm]]
+    if(nrow(df)==0) return(NULL)
+    df$sourceDB <- nm
+    df
+  }))
+  if(!is.null(comb) && nrow(comb)>0){
+    write.table(comb, enrich_file, sep = "\t", row.names = FALSE, quote = FALSE)
+  } else {
+    message("EnrichR returned no hits for the provided gene set and DBs.")
+  }
+} else {
+  message("No enrichR results available. Skipping enrichment export.")
+}
+
+message("Done. Files written:")
+message(" - edge list: ", edge_file)
+message(" - node attributes: ", node_file)
+message(" - enrichment summary: ", enrich_file)
