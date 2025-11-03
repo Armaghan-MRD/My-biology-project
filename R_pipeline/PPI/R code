@@ -1,0 +1,140 @@
+# ============================================================
+# UNIVERSAL PPI Builder (BioGRID) for Cytoscape
+# Author: Armaghan Moradi
+# Description:
+#   - Builds protein–protein interaction (PPI) networks from BioGRID
+#   - Works with any cancer or disease project
+#   - Outputs edge and node tables (with degree, betweenness, closeness)
+# ============================================================
+
+## ---- Dependencies ----
+pkgs <- c("readxl", "dplyr", "stringr", "readr", "data.table", "tibble", "igraph")
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+lapply(pkgs, library, character.only = TRUE)
+
+## ---- Parameters (EDIT THESE ONLY) ----
+project_name  <- "Neuroblastoma"
+deg_file      <- "E:/R/RStudio/R CLASS/Plots/RRA filessssss/Neuroblastoma__RRA_results_final.xlsx"
+biogrid_file  <- "E:/R/RStudio/R CLASS/Plots/RRA filessssss/BIOGRID-ORGANISM-Homo_sapiens-5.0.250.tab3.txt"
+out_dir       <- file.path("E:/R/RStudio/R CLASS/Plots/PPI", project_name)
+
+up_sheet      <- 3
+down_sheet    <- 4
+filter_mode   <- "any"  # "any" = DEG–any partner, "both" = DEG–DEG only
+
+## ---- Helper: Read DEG sheet ----
+read_deg_sheet <- function(path, sheet, label) {
+  df <- read_excel(path, sheet = sheet)
+  gene_cols <- c("SYMBOL", "Symbol", "Name", "Gene", "GeneSymbol", "GENE")
+  gene_col <- intersect(gene_cols, colnames(df))[1]
+  if (is.na(gene_col))
+    stop(sprintf("❌ No gene column found in sheet %s.", sheet))
+  
+  df %>%
+    rename(SYMBOL = all_of(gene_col)) %>%
+    mutate(SYMBOL = toupper(str_trim(SYMBOL)),
+           Regulation = label) %>%
+    distinct(SYMBOL, .keep_all = TRUE)
+}
+
+## ---- Read Up & Down ----
+up   <- read_deg_sheet(deg_file, up_sheet, "Up")
+down <- read_deg_sheet(deg_file, down_sheet, "Down")
+deg_all <- bind_rows(up, down) %>% distinct(SYMBOL, .keep_all = TRUE)
+deg_genes <- unique(deg_all$SYMBOL)
+cat("✅ Loaded DEGs:", length(deg_genes), "\n")
+
+## ---- Read BioGRID ----
+biogrid <- fread(biogrid_file, sep = "\t", header = TRUE, quote = "", data.table = FALSE)
+req_cols <- c("Official Symbol Interactor A", "Official Symbol Interactor B")
+if (!all(req_cols %in% colnames(biogrid)))
+  stop("❌ BioGRID file missing expected columns.")
+
+biogrid_simplified <- biogrid %>%
+  select(Protein1 = `Official Symbol Interactor A`,
+         Protein2 = `Official Symbol Interactor B`,
+         Score = any_of("Score")) %>%
+  mutate(across(c(Protein1, Protein2), ~toupper(str_trim(.)))) %>%
+  filter(Protein1 != "" & Protein2 != "" & Protein1 != Protein2) %>%
+  distinct()
+
+## ---- Filter DEGs ----
+ppi_deg <- if (filter_mode == "any") {
+  filter(biogrid_simplified, Protein1 %in% deg_genes | Protein2 %in% deg_genes)
+} else {
+  filter(biogrid_simplified, Protein1 %in% deg_genes & Protein2 %in% deg_genes)
+}
+cat("✅ Filtered PPI edges:", nrow(ppi_deg), "\n")
+
+## ---- Annotate edges ----
+ppi_annot <- ppi_deg %>%
+  left_join(deg_all %>% select(SYMBOL, Regulation), by = c("Protein1" = "SYMBOL")) %>%
+  rename(Reg1 = Regulation) %>%
+  left_join(deg_all %>% select(SYMBOL, Regulation), by = c("Protein2" = "SYMBOL")) %>%
+  rename(Reg2 = Regulation) %>%
+  mutate(across(c(Reg1, Reg2), ~replace_na(., "NotDEG")),
+         RegulationPair = paste(Reg1, Reg2, sep = "-"))
+
+## ---- Node table & centralities ----
+cat("⚙️  Computing degree, betweenness, closeness...\n")
+g <- graph_from_data_frame(ppi_annot[, c("Protein1", "Protein2")], directed = FALSE)
+
+centrality <- tibble(
+  name = names(V(g)),
+  degree = degree(g),
+  betweenness = betweenness(g, normalized = TRUE),
+  closeness = closeness(g, normalized = TRUE)
+)
+
+node_table <- tibble(name = V(g)$name) %>%
+  left_join(deg_all %>% select(SYMBOL, Regulation), by = c("name" = "SYMBOL")) %>%
+  mutate(Regulation = replace_na(Regulation, "NotDEG")) %>%
+  left_join(centrality, by = "name")
+
+## ---- Save outputs ----
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+edge_out <- file.path(out_dir, paste0(project_name, "_PPI_edges_for_Cytoscape.tsv"))
+node_out <- file.path(out_dir, paste0(project_name, "_PPI_nodes_for_Cytoscape.tsv"))
+
+write.table(ppi_annot, edge_out, sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(node_table, node_out, sep = "\t", quote = FALSE, row.names = FALSE)
+
+cat("✅ Saved edge list:", edge_out, "\n")
+cat("✅ Saved node table:", node_out, "\n")
+print(table(node_table$Regulation))
+
+## ---- Build subnetwork (Core + First Neighbors) ----
+core_genes <- node_table %>%
+  filter(Regulation %in% c("Up", "Down")) %>%
+  pull(name) %>%
+  unique()
+
+first_neighbors <- unique(unlist(neighborhood(g, order = 1, nodes = core_genes)))
+first_neighbors <- setdiff(first_neighbors, core_genes)
+
+nodes_aug <- node_table %>%
+  mutate(Group = case_when(
+    name %in% core_genes ~ "Core",
+    name %in% first_neighbors ~ "FirstNeighbor",
+    TRUE ~ "Other"
+  ))
+
+sub_nodes <- filter(nodes_aug, Group %in% c("Core", "FirstNeighbor"))
+sub_edges <- ppi_annot %>%
+  filter(Protein1 %in% sub_nodes$name | Protein2 %in% sub_nodes$name) %>%
+  mutate(EdgeType = case_when(
+    Protein1 %in% core_genes & Protein2 %in% core_genes ~ "Core-Core",
+    Protein1 %in% core_genes | Protein2 %in% core_genes ~ "Core-Neighbor",
+    TRUE ~ "Neighbor-Neighbor"
+  ))
+
+## ---- Save subnetwork ----
+write.table(nodes_aug, file.path(out_dir, paste0(project_name, "_PPI_nodes_augmented.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(sub_nodes, file.path(out_dir, paste0(project_name, "_PPI_nodes_core_neighbors.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(sub_edges, file.path(out_dir, paste0(project_name, "_PPI_edges_core_neighbors.tsv")),
+            sep = "\t", quote = FALSE, row.names = FALSE)
+
+cat("\n✅ Subnetwork saved for Cytoscape visualization.\n")
+cat("🟠 Core = DEGs (Up/Down)\n🟣 FirstNeighbor = neighbors of DEGs\n")
