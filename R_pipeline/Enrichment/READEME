@@ -1,0 +1,27 @@
+This R script performs robust pathway enrichment analysis for Neuroblastoma differential gene expression results.
+It integrates GO, KEGG, and Reactome enrichment, producing publication-quality plots and tables for biological interpretation.
+
+The workflow is fully automated — from reading DEGs to enrichment, visualization, and exporting outputs — and can easily be adapted to other cancer types or datasets.
+
+🚀 Features
+
+Automatic package installation and loading (CRAN + Bioconductor).
+
+GO, KEGG, and Reactome enrichment for up- and downregulated genes.
+Robust gene ID mapping (SYMBOL → ENTREZ).
+Safe data handling for mixed or missing fields (e.g., GeneRatio, p.adjust).
+Publication-quality dotplots and barplots using ggplot2.
+Output-ready files for further integration with Cytoscape or reports.
+
+📂 Input Requirements
+Excel file containing two sheets:
+
+UP — list of upregulated genes (column: Name)
+DOWN — list of downregulated genes (column: Name)
+
+Output Files:
+*_GO_enrichment.csv — Gene Ontology enrichment tables
+*_KEGG_enrichment.csv — KEGG pathway tables
+*_Reactome.csv — Reactome enrichment results
+Neuroblastoma__Activated_Suppressed_Dotplot.png — side-by-side Reactome dotplot
+Neuroblastoma_GO_Terms_Barplot_Real.png — combined GO BP barplot
