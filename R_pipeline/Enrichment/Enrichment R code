@@ -1,0 +1,317 @@
+# ============================================================
+# Enrichment (Robust) - Neuroblastoma
+# ============================================================
+options(stringsAsFactors = FALSE)
+
+# ---- Install / load dependencies ----
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+pkgs_cran <- c("ggplot2", "dplyr", "scales", "openxlsx", "gridExtra")
+for (p in pkgs_cran) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+bioc_pkgs <- c("ReactomePA", "clusterProfiler", "enrichplot", "DOSE", "org.Hs.eg.db")
+for (p in bioc_pkgs) if (!requireNamespace(p, quietly = TRUE)) BiocManager::install(p)
+
+library(ggplot2); library(dplyr); library(scales); library(openxlsx); library(gridExtra)
+library(clusterProfiler); library(ReactomePA); library(enrichplot); library(DOSE); library(org.Hs.eg.db)
+library(AnnotationDbi)
+
+# ---- File paths (edit path to your folder) ----
+path <- "E:/R/RRA files"
+preferred_file <- "Neuroblastoma__RRA_results_final.xlsx"
+outdir <- file.path(path, "Enrichment_results_Neuroblastoma")
+dir.create(outdir, recursive = TRUE, showWarnings = FALSE)
+
+# ---- Load UP and DOWN sheets ----
+up_data <- read.xlsx(file.path(path, preferred_file), sheet = "UP")
+down_data <- read.xlsx(file.path(path, preferred_file), sheet = "DOWN")
+
+# Use "Name" column for gene symbols (adjust if different)
+up_genes <- as.character(up_data$Name)
+down_genes <- as.character(down_data$Name)
+
+# ---- Convert gene symbols to ENTREZ IDs (robust, with alias fallback) ----
+# Primary mapping
+up_map <- bitr(up_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+down_map <- bitr(down_genes, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+# Report mapping rates & save unmapped lists
+unmapped_up <- setdiff(unique(up_genes), unique(up_map$SYMBOL))
+unmapped_down <- setdiff(unique(down_genes), unique(down_map$SYMBOL))
+
+message("UP mapping: ", nrow(up_map), " / ", length(unique(up_genes)), " | DOWN mapping: ", nrow(down_map), " / ", length(unique(down_genes)) )
+
+
+# Final ENTREZ lists (unique)
+up_ids <- up_map %>% distinct(ENTREZID) %>% pull(ENTREZID)
+down_ids <- down_map %>% distinct(ENTREZID) %>% pull(ENTREZID)
+
+# Save mapping tables for inspection
+write.csv(up_map, file.path(outdir, "Neuroblastoma_UP_symbol_to_entrez.csv"), row.names = FALSE)
+write.csv(down_map, file.path(outdir, "Neuroblastoma_DOWN_symbol_to_entrez.csv"), row.names = FALSE)
+
+# ---------------------------
+# Robust tidy_enrich + plotting
+# ---------------------------
+
+# safe parser for GeneRatio
+safe_parse_GeneRatio <- function(gr_column) {
+  if (is.null(gr_column)) return(rep(NA_real_, 0))
+  n <- length(gr_column)
+  out <- rep(NA_real_, n)
+  if (is.list(gr_column) && !is.data.frame(gr_column)) {
+    gr_char <- sapply(gr_column, function(x) {
+      if (is.null(x) || length(x) == 0) return(NA_character_)
+      paste0(as.character(x), collapse = "/")
+    }, USE.NAMES = FALSE)
+  } else gr_char <- as.character(gr_column)
+  for (i in seq_along(gr_char)) {
+    v <- gr_char[i]
+    if (is.na(v) || v == "" || v == "NA") { out[i] <- NA_real_; next }
+    if (grepl("/", v)) {
+      parts <- strsplit(gsub("\\s+", "", v), "/")[[1]]
+      if (length(parts) >= 2 && all(grepl("^\\d+$", parts[1:2]))) {
+        num <- as.numeric(parts[1]); den <- as.numeric(parts[2])
+        out[i] <- ifelse(!is.na(num) && !is.na(den) && den != 0, num/den, NA_real_)
+      } else {
+        out[i] <- NA_real_
+      }
+    } else {
+      suppressWarnings({ rn <- as.numeric(v) })
+      out[i] <- ifelse(is.na(rn), NA_real_, rn)
+    }
+  }
+  out
+}
+
+tidy_enrich <- function(er, direction_label) {
+  df <- as.data.frame(er)
+  # Ensure Description exists
+  if (!"Description" %in% colnames(df) && "ID" %in% colnames(df)) df$Description <- as.character(df$ID)
+  if (!"Description" %in% colnames(df)) df$Description <- as.character(rownames(df))
+  df$Description <- as.character(df$Description)
+  
+  # GeneRatio safe parse
+  if ("GeneRatio" %in% colnames(df)) df$GeneRatioNum <- safe_parse_GeneRatio(df$GeneRatio)
+  else if ("Ratio" %in% colnames(df)) df$GeneRatioNum <- safe_parse_GeneRatio(df$Ratio)
+  else df$GeneRatioNum <- NA_real_
+  
+  # Count and p.adjust handling
+  if (!"Count" %in% colnames(df) && "geneID" %in% colnames(df)) {
+    df$Count <- sapply(strsplit(as.character(df$geneID), "/"), function(x) sum(nzchar(x)))
+  }
+  if (!"Count" %in% colnames(df)) df$Count <- NA_real_
+  if (!"p.adjust" %in% colnames(df) && "FDR" %in% colnames(df)) df$p.adjust <- as.numeric(df$FDR)
+  if (!"p.adjust" %in% colnames(df)) df$p.adjust <- NA_real_
+  
+  df2 <- df %>% dplyr::select(Description, GeneRatio = GeneRatioNum, Count, p.adjust)
+  df2$direction <- as.character(direction_label)
+  
+  # enforce atomic types
+  df2$Description <- as.character(df2$Description)
+  df2$GeneRatio <- as.numeric(df2$GeneRatio)
+  df2$Count <- as.numeric(df2$Count)
+  df2$p.adjust <- as.numeric(df2$p.adjust)
+  df2$direction <- as.character(df2$direction)
+  df2
+}
+
+plot_activated_suppressed <- function(ego_up, ego_down, top_n = 12, out_file = NULL, width = 12, height = 8) {
+  up_df <- tidy_enrich(ego_up, "Activated")
+  down_df <- tidy_enrich(ego_down, "Suppressed")
+  
+  if (nrow(up_df) == 0 && nrow(down_df) == 0) stop("Both enrichment results are empty.")
+  
+  # Sort & pick top_n robustly
+  pick_top <- function(df, n) {
+    if (nrow(df) == 0) return(df)
+    if (all(is.na(df$GeneRatio))) {
+      df <- df[order(-df$Count, na.last = TRUE), , drop = FALSE]
+    } else {
+      # put NA GeneRatio last
+      gr <- df$GeneRatio
+      gr[is.na(gr)] <- -Inf
+      df <- df[order(-gr, -df$Count, na.last = TRUE), , drop = FALSE]
+    }
+    head(df, n)
+  }
+  
+  top_up <- pick_top(up_df, top_n)
+  top_down <- pick_top(down_df, top_n)
+  
+  combined <- bind_rows(top_up, top_down) %>%
+    group_by(direction) %>%
+    mutate(Description = factor(Description, levels = rev(unique(Description)))) %>%
+    ungroup()
+  
+  if (nrow(combined) == 0) stop("No terms to plot after selection.")
+  
+  p <- ggplot(combined, aes(x = GeneRatio, y = Description)) +
+    geom_point(aes(size = Count, color = p.adjust)) +
+    facet_grid(. ~ direction, scales = "free_y", space = "free") +
+    scale_size_continuous(range = c(3, 10), breaks = pretty(combined$Count, n = 4)) +
+    scale_color_gradientn(name = "p.adjust", colours = c("#E64B35", "#5E4FA2", "#3288BD")) +
+    labs(x = "GeneRatio", y = NULL, title = "Enriched pathways (Neuroblastoma)") +
+    theme_minimal(base_size = 14) +
+    theme(
+      axis.text.y = element_text(size = 12),
+      axis.text.x = element_text(size = 12),
+      strip.text = element_text(size = 14, face = "bold"),
+      plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 1),
+      panel.spacing = unit(0.2, "lines")
+    ) +
+    coord_cartesian(xlim = c(0, 1))
+  
+  if (!is.null(out_file)) {
+    ggsave(out_file, p, width = width, height = height)
+    message("Saved plot to: ", out_file)
+  } else print(p)
+}
+
+# ---- Function for GO + KEGG enrichment and plotting (cleaned) ----
+run_enrichment <- function(gene_ids, label, go_title, kegg_title, outdir) {
+  ego <- enrichGO(
+    gene = gene_ids,
+    OrgDb = org.Hs.eg.db,
+    keyType = "ENTREZID",
+    ont = "ALL",
+    pAdjustMethod = "BH",
+    pvalueCutoff = 1,
+    qvalueCutoff = 1,
+    readable = TRUE
+  )
+  
+  ekegg <- enrichKEGG(
+    gene = gene_ids,
+    organism = "hsa",
+    pvalueCutoff = 1
+  )
+  
+  write.csv(as.data.frame(ego), file.path(outdir, paste0(label, "_GO_enrichment.csv")), row.names = FALSE)
+  write.csv(as.data.frame(ekegg), file.path(outdir, paste0(label, "_KEGG_enrichment.csv")), row.names = FALSE)
+  
+  pdf(file.path(outdir, paste0(label, "_GO_dotplot.pdf")), width = 10, height = 8)
+  print(
+    dotplot(ego, split = "ONTOLOGY") +
+      facet_grid(ONTOLOGY ~ ., scale = "free") +
+      ggtitle(go_title) +
+      theme(
+        plot.title = element_text(size = 18, face = "bold"),
+        axis.text.x = element_text(size = 11, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 7, face = "bold"),
+        legend.text = element_text(size = 12)
+      )
+  )
+  dev.off()
+  
+  pdf(file.path(outdir, paste0(label, "_KEGG_barplot.pdf")), width = 10, height = 8)
+  print(
+    barplot(ekegg, showCategory = 15, title = kegg_title) +
+      theme(
+        plot.title = element_text(size = 18, face = "bold"),
+        axis.text.x = element_text(size = 12, angle = 45, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        legend.text = element_text(size = 12)
+      )
+  )
+  dev.off()
+}
+
+# ============================================================
+# Reactome Enrichment — Neuroblastoma (UP & DOWN)
+# ============================================================
+reactome_up <- enrichPathway(gene = up_ids, organism = "human", pvalueCutoff = 1, readable = TRUE)
+reactome_down <- enrichPathway(gene = down_ids, organism = "human", pvalueCutoff = 1, readable = TRUE)
+
+write.csv(as.data.frame(reactome_up), file.path(outdir, "Neuroblastoma__UP_Reactome.csv"), row.names = FALSE)
+write.csv(as.data.frame(reactome_down), file.path(outdir, "Neuroblastoma__DOWN_Reactome.csv"), row.names = FALSE)
+
+# Plot side-by-side (robust)
+plot_activated_suppressed(reactome_up, reactome_down, top_n = 12,
+                          out_file = file.path(outdir, "Neuroblastoma__Activated_Suppressed_Dotplot.png"),
+                          width = 12, height = 8)
+
+# ---- Run GO + KEGG enrichment and save results/plots ----
+run_enrichment(up_ids, label = "Neuroblastoma_Upregulated",
+               go_title = "GO Enrichment of Neuroblastoma Upregulated Genes",
+               kegg_title = "Neuroblastoma Upregulated Genes KEGG Pathways",
+               outdir = outdir)
+
+run_enrichment(down_ids, label = "Neuroblastoma_Downregulated",
+               go_title = "GO Enrichment of Neuroblastoma Downregulated Genes",
+               kegg_title = "Neuroblastoma Downregulated Genes KEGG Pathways",
+               outdir = outdir)
+
+# ============================================================
+# GO Barplot (REAL DATA) - robust CSV loader & plotting
+# ============================================================
+flatten_df_columns <- function(df) {
+  for (nm in names(df)) {
+    col <- df[[nm]]
+    if (is.list(col) && !is.data.frame(col)) {
+      df[[nm]] <- sapply(col, function(el) {
+        if (is.null(el)) return(NA_character_)
+        paste0(as.character(el), collapse = "/")
+      }, USE.NAMES = FALSE)
+    } else {
+      df[[nm]] <- as.character(df[[nm]])
+    }
+  }
+  df
+}
+safe_num <- function(x) { suppressWarnings(as.numeric(as.character(x))) }
+
+load_and_prepare_go <- function(file) {
+  if (!file.exists(file)) stop("File not found: ", file)
+  df <- read.csv(file, stringsAsFactors = FALSE, check.names = FALSE)
+  df <- flatten_df_columns(df)
+  if (!"ONTOLOGY" %in% colnames(df)) stop("Expected column 'ONTOLOGY' not found in ", file)
+  if (!"Description" %in% colnames(df)) {
+    if ("ID" %in% colnames(df)) df$Description <- df$ID else df$Description <- paste0("term_", seq_len(nrow(df)))
+  }
+  if ("p.adjust" %in% colnames(df)) df$p.adjust <- safe_num(df$p.adjust) else if ("FDR" %in% colnames(df)) df$p.adjust <- safe_num(df$FDR) else df$p.adjust <- NA_real_
+  if ("Count" %in% colnames(df)) df$Count <- safe_num(df$Count) else if ("geneID" %in% colnames(df)) df$Count <- sapply(strsplit(df$geneID, "/"), function(x) sum(nzchar(x))) else df$Count <- NA_real_
+  df$Description <- as.character(df$Description); df$ONTOLOGY <- as.character(df$ONTOLOGY)
+  df
+}
+
+up_go_file <- file.path(outdir, "Neuroblastoma_Upregulated_GO_enrichment.csv")
+down_go_file <- file.path(outdir, "Neuroblastoma_Downregulated_GO_enrichment.csv")
+df_down <- load_and_prepare_go(down_go_file)
+df_up <- load_and_prepare_go(up_go_file)
+
+topN <- function(df, n = 10) {
+  df_bp <- df[df$ONTOLOGY == "BP", , drop = FALSE]
+  if (nrow(df_bp) == 0) return(df_bp)
+  if (all(is.na(df_bp$p.adjust))) ord <- order(-df_bp$Count, na.last = TRUE) else { pvec <- df_bp$p.adjust; pvec[is.na(pvec)] <- Inf; ord <- order(pvec, -df_bp$Count, na.last = TRUE) }
+  df_top <- df_bp[head(ord, n), , drop = FALSE]
+  df_top$logFDR <- -log10(ifelse(is.na(df_top$p.adjust) | df_top$p.adjust <= 0, NA_real_, df_top$p.adjust))
+  if (all(is.na(df_top$logFDR))) df_top$GO_Term <- factor(df_top$Description, levels = rev(df_top$Description[order(df_top$Count)])) else df_top$GO_Term <- factor(df_top$Description, levels = rev(df_top$Description[order(df_top$logFDR)]))
+  df_top
+}
+
+df_downregulated_real <- topN(df_down, 10)
+df_upregulated_real <- topN(df_up, 10)
+
+# Plots: wrap long labels
+library(grid)
+plot_down <- ggplot(df_downregulated_real, aes(x = logFDR, y = GO_Term)) +
+  geom_bar(stat = "identity", fill = "#4C72B0", width = 0.3) +
+  scale_y_discrete(labels = scales::label_wrap(width = 40)) +
+  labs(title = "Top 10 Downregulated GO terms (BP)", x = "-log10(Adjusted P-value)", y = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5), axis.text.y = element_text(face = "bold", size = 12), axis.title.x = element_text(size = 14), axis.line = element_line(color = "black"), panel.background = element_rect(fill = "white", color = NA), plot.background = element_rect(fill = "white", color = NA), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_blank())
+
+plot_up <- ggplot(df_upregulated_real, aes(x = logFDR, y = GO_Term)) +
+  geom_bar(stat = "identity", fill = "#C44E52", width = 0.3) +
+  scale_y_discrete(labels = scales::label_wrap(width = 40)) +
+  labs(title = "Top 10 Upregulated GO terms (BP)", x = "-log10(Adjusted P-value)", y = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5), axis.text.y = element_text(face = "bold", size = 12), axis.title.x = element_text(size = 14), axis.line = element_line(color = "black"), panel.background = element_rect(fill = "white", color = NA), plot.background = element_rect(fill = "white", color = NA), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.border = element_blank())
+
+final_plot <- grid.arrange(plot_down, plot_up, ncol = 2, top = textGrob("GO Biological Process Enrichment in Neuroblastoma", gp = gpar(fontface = "bold", fontsize = 18)))
+
+ggsave(file.path(outdir, "Neuroblastoma_GO_Terms_Barplot_Real.png"), plot = final_plot, width = 16, height = 8, bg = "white")
+message("✅ Combined GO Barplot saved as: ", file.path(outdir, "Neuroblastoma_GO_Terms_Barplot_Real.png"))
+message("✅ Neuroblastoma enrichment analysis complete! Results saved in: ", outdir)
